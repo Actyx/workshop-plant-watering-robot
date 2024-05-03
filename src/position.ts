@@ -1,5 +1,8 @@
 import type { Pos } from './types'
 
+/**
+ * A position in the 2D space.
+ */
 export class Position {
   constructor(readonly x: number, readonly y: number) {}
 
@@ -9,12 +12,6 @@ export class Position {
 
   static random() {
     return new Position(Math.random() * 1000, Math.random() * 1000);
-  }
-
-  distance(other: Position) {
-    const x = this.x - other.x;
-    const y = this.y - other.y;
-    return Math.sqrt(x * x + y * y);
   }
 
   direction(other: Position) {
@@ -32,15 +29,14 @@ export class Position {
   }
 }
 
+/**
+ * A 2D vector.
+ */
 export class Vec {
   constructor(public x: number, public y: number) {}
 
   add(other: Vec) {
     return new Vec(this.x + other.x, this.y + other.y);
-  }
-
-  sub(other: Vec) {
-    return new Vec(this.x - other.x, this.y - other.y);
   }
 
   scale(factor: number) {
