@@ -9,6 +9,14 @@
       "problemMatcher": [],
       "label": "npm: build - packages/workshop",
       "detail": "tsc"
+    },
+    {
+      "type": "npm",
+      "script": "build",
+      "group": "build",
+      "problemMatcher": "$tsc",
+      "label": "npm: build",
+      "detail": "tsc"
     }
   ]
 }

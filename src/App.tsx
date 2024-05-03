@@ -1,0 +1,148 @@
+import { Actyx } from "@actyx/sdk"
+import { useEffect, useState } from "react"
+import { PlantState, followPlant, runPlant } from "./plant"
+import { RobotState, followRobot, runRobot } from "./robot"
+import * as UUID from 'uuid'
+import { Position } from "./position"
+import { deepEqual } from "fast-equals"
+
+const findIds = (actyx: Actyx, tag: string, addCb: (_: string) => void, delCb: (_: string) => void) => {
+  const set = new Map<string, Date>()
+
+  setInterval(() => {
+    const toRemove: string[] = []
+    const now = new Date()
+    for (const [plant, timestamp] of set) {
+      if (now.getTime() - timestamp.getTime() > 60_000) toRemove.push(plant)
+    }
+    for (const plant of toRemove) {
+      set.delete(plant)
+      delCb(plant)
+    }
+  }, 1000)
+
+  const tagIdStart = `${tag}:`
+  actyx.subscribeAql(`FROM "${tag}" & TIME > 1m ago`, (resp) => {
+    if (resp.type !== 'event') return
+    const id = resp.meta.tags.filter(x => x.startsWith(tagIdStart))[0].slice(tagIdStart.length)
+    if (!set.has(id)) {
+      addCb(id)
+    }
+    set.set(id, resp.meta.timestampAsDate())
+  }, (err) => console.log('findPlants stopped due to error:', err))
+}
+
+const findPlants = (actyx: Actyx, addCb: (_: string) => void, delCb: (_: string) => void) => findIds(actyx, 'plant', addCb, delCb)
+const findRobots = (actyx: Actyx, addCb: (_: string) => void, delCb: (_: string) => void) => findIds(actyx, 'robot', addCb, delCb)
+
+type Mgmt<T> =
+  | { type: 'fresh', id: string, cancel: () => void }
+  | { type: 'ready', id: string, cancel: () => void, state: T }
+const add = <T extends Record<string, unknown>>(actyx: Actyx, setter: (_: (_: Mgmt<T>[]) => Mgmt<T>[]) => void, id: string,
+    factory: (_: Actyx, id: string, state: (_: T) => void, died: () => void) => ((() => void) | Promise<void>)) => {
+  console.log('adding', id)
+  const died = () => del(setter, id)
+  const res = factory(actyx, id, (state) => {
+    setter((set) => deepEqual(state, set.find(x => x.id === id)) ? set : set.map(x => x.id === id ? { ...x, type: 'ready', state } : x))
+  }, died)
+  const cancel = res instanceof Promise ? () => {} : res
+  const state = { type: 'fresh' as const, cancel, id }
+  setter(set => [...set, state])
+}
+const del = <T extends Record<string, unknown>>(setter: (_: (_: Mgmt<T>[]) => Mgmt<T>[]) => void, id: string) => setter((set) => {
+  const idx = set.findIndex(x => x.id === id)
+  if (idx < 0) return set
+  console.log('removing', id)
+  const next = [...set]
+  next.splice(idx, 1)[0].cancel()
+  return next
+})
+
+type Props = { actyx: Actyx }
+
+const persistentId = (key: string) => {
+  const l = localStorage.getItem(key)
+  if (l) return l
+  const id = UUID.v4()
+  localStorage.setItem(key, id)
+  return id
+}
+
+export const App = ({ actyx }: Props) => {
+  let effectHasRun = false
+  useEffect(() => {
+    if (effectHasRun) {
+      console.log('preventing double run')
+      return
+    } else {
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      effectHasRun = true
+      console.log('useEffect')
+    }
+
+    let myPlant = persistentId('plantId')
+    const myRobot =persistentId('robotId')
+    console.log('starting: plant', myPlant, 'robot', myRobot)
+
+    const restart = () => {
+      console.log('plant died')
+      localStorage.removeItem('plantId')
+      myPlant = persistentId('plantId')
+      runPlant(actyx, myPlant, () => {}, restart)
+    }
+    runPlant(actyx, myPlant, () => {}, restart)
+    runRobot(actyx, myRobot, () => {})
+
+    findPlants(actyx, (id) => add(actyx, setPlants, id, followPlant), (id) => del(setPlants, id))
+    findRobots(actyx, (id) => add(actyx, setRobots, id, followRobot), (id) => del(setRobots, id))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [actyx])
+
+  const [plants, setPlants] = useState<Mgmt<PlantState>[]>([])
+  const [robots, setRobots] = useState<Mgmt<RobotState>[]>([])
+  
+  return (
+    <div>
+      <h1>Plants</h1>
+      <table>
+        <thead>
+          <tr>
+            <th>Id</th>
+            <th>Position</th>
+            <th>Water Level</th>
+            <th>Mission</th>
+          </tr>
+        </thead>
+        <tbody>
+          {plants.map((plant) => plant.type === 'ready' && (
+            <tr key={plant.id}>
+              <td>{plant.id}</td>
+              <td>{Position.fromPos(plant.state.pos).toString()}</td>
+              <td>{plant.state.waterLevel.toFixed(0)}</td>
+              <td>{plant.state.mission}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <h1>Robots</h1>
+      <table>
+        <thead>
+          <tr>
+            <th>Id</th>
+            <th>Position</th>
+            <th>Mission</th>
+          </tr>
+        </thead>
+        <tbody>
+          {robots.map((robot) => robot.type === 'ready' && (
+            <tr key={robot.id}>
+              <td>{robot.id}</td>
+              <td>{Position.fromPos(robot.state.pos).toString()}</td>
+              <td>{robot.state.mission}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
