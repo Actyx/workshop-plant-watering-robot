@@ -91,7 +91,7 @@ const RobotTag = Tag<AllEvents>('robot')
  * @param stateCb callback to update the UI with the robot’s state
  * @param diedCb callback to call when the robot dies
  */
-export const runRobot = async (actyx: Actyx, id: string, stateCb: (state: RobotState) => void) => {
+export const runRobot = async (isAlive: () => boolean, actyx: Actyx, id: string, stateCb: (state: RobotState) => void) => {
   // this is the basic set of tags for the robot ('robot' and 'robot:<id>')
   const myTag = RobotTag.withId(id)
 
@@ -109,14 +109,19 @@ export const runRobot = async (actyx: Actyx, id: string, stateCb: (state: RobotS
     }
   })()
 
+  if (!isAlive()) return;
+
   // get the last known mission by looking at the last mission event, if any
   let mission = (await queryAql<string>(actyx, `PRAGMA features := aggregate
       FROM ${myTag} & ${MissionTag} AGGREGATE LAST(_.mission)`)).at(0)?.payload
+
+  if (!isAlive()) return;
 
   if (mission) {
     // get last known position from most recent mission
     const machine = createMachineRunner(actyx, myTag, Initial, undefined).refineStateType(AllStates)
     for await (const { payload } of machine) {
+      if (!isAlive()) return;
       if (payload && 'robot' in payload) {
         pos = payload.robot
       }
@@ -128,6 +133,8 @@ export const runRobot = async (actyx: Actyx, id: string, stateCb: (state: RobotS
    * The main loop alternates between waiting for a mission and executing it.
    */
   for (;;) {
+    if (!isAlive()) return;
+
     stateCb({ pos, mission })
 
     if (mission) {
@@ -138,6 +145,8 @@ export const runRobot = async (actyx: Actyx, id: string, stateCb: (state: RobotS
       let waitForAccept: NodeJS.Timeout | null = null
       
       for await (const state of machine) {
+        if (!isAlive()) return;
+
         if (state.is(Requested)) {
           const s = state.cast()
           if (!s.payload.robots.includes(id)) {
@@ -221,12 +230,16 @@ export const runRobot = async (actyx: Actyx, id: string, stateCb: (state: RobotS
         `)
 
       for (const { meta } of missions) {
+        if (!isAlive()) return;
+
         // get the watering request ID from the protocol tag
         const m = meta.tags.filter((x) => x.startsWith('wateringProtocol:')).at(0)!.slice('wateringProtocol:'.length)
 
         // check if the mission is free; this is best done by running the protocol
         const machine = createMachineRunner(actyx, protocol.tagWithEntityId(m), Initial, undefined)
         for await (const state of machine) {
+          if (!isAlive()) return;
+          
           if (state.is(Requested)) {
             mission = m
           }
