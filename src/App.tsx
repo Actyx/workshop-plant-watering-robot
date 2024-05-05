@@ -1,10 +1,10 @@
 import { Actyx } from "@actyx/sdk"
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { PlantState, followPlant, runPlant } from "./plant"
 import { RobotState, followRobot, runRobot } from "./robot"
 import * as UUID from 'uuid'
 import { Position } from "./position"
-import { deepEqual } from "fast-equals"
+import { cleanup, mpmc } from "./util"
 
 /**
  * Subscribe to Actyx event streams and detect when IDs for a given tag are newly detected or
@@ -22,7 +22,7 @@ const findIds = (actyx: Actyx, tag: string, addCb: (_: string) => void, delCb: (
   const set = new Map<string, Date>()
 
   // Check every second if a plant has been inactive for more than a minute and remove it if so
-  setInterval(() => {
+  const gc = setInterval(() => {
     const toRemove: string[] = []
     const now = new Date()
     for (const [plant, timestamp] of set) {
@@ -36,7 +36,7 @@ const findIds = (actyx: Actyx, tag: string, addCb: (_: string) => void, delCb: (
 
   // Subscribe to the event stream for the given tag, extract the ID from the event tags and add it to the set
   const tagIdStart = `${tag}:`
-  actyx.subscribeAql(`FROM "${tag}" & TIME > 1m ago`, (resp) => {
+  const unsub = actyx.subscribeAql(`FROM "${tag}" & TIME > 1m ago`, (resp) => {
     if (resp.type !== 'event') return
     const id = resp.meta.tags.filter(x => x.startsWith(tagIdStart))[0].slice(tagIdStart.length)
     if (!set.has(id)) {
@@ -44,6 +44,11 @@ const findIds = (actyx: Actyx, tag: string, addCb: (_: string) => void, delCb: (
     }
     set.set(id, resp.meta.timestampAsDate())
   }, (err) => console.log('findPlants stopped due to error:', err))
+
+  return () => {
+    clearInterval(gc)
+    unsub()
+  }
 }
 
 const findPlants = (actyx: Actyx, addCb: (_: string) => void, delCb: (_: string) => void) => findIds(actyx, 'plant', addCb, delCb)
@@ -65,27 +70,30 @@ type Mgmt<T> =
  * if the state has actually changed.
  * 
  * @param actyx Actyx SDK instance
- * @param setter React state update function for the list of managed states
+ * @param map React state update function for the list of managed states
  * @param id ID of the plant or robot to be added
  * @param factory constructor for the function that will manage the state of this plant or robot
  */
-const add = <T extends Record<string, unknown>>(actyx: Actyx, setter: (_: (_: Mgmt<T>[]) => Mgmt<T>[]) => void, id: string,
-    factory: (_: Actyx, id: string, state: (_: T) => void, died: () => void) => ((() => void) | Promise<void>)) => {
+const add = <T extends Record<string, unknown>>(actyx: Actyx, sync: () => unknown, map: Map<string, Mgmt<T>>, id: string,
+    factory: (_: Actyx, id: string, state: (_: T) => void, died: () => void) => ((() => void))) => {
+  if (map.has(id)) return;
   console.log('adding', id)
 
   // start running or following a plant or robot
   const res = factory(actyx, id, (state) => {
-    setter((set) =>
-      deepEqual(state, set.find(x => x.id === id))
-        ? set : set.map(x => x.id === id ? { ...x, type: 'ready', state }
-        : x))
-  }, () => del(setter, id))
+    const old = map.get(id);
+    if (!old) return
+    const readyState = { ...old, type: 'ready' as const, state };
+    map.set(id, readyState);
+    sync()
+  }, () => del(sync, map, id))
 
-  const cancel = res instanceof Promise ? () => {} : res
-  const state = { type: 'fresh' as const, cancel, id }
+  const state = { type: 'fresh' as const, cancel: res, id }
 
-  // ensure that the state is already in the list when the factory uses the setter
-  setter(set => [...set, state])
+  map.set(id, state);
+  sync()
+
+  return res
 }
 
 /**
@@ -93,17 +101,13 @@ const add = <T extends Record<string, unknown>>(actyx: Actyx, setter: (_: (_: Mg
  * This submits the corresponding change logic to React, which will call the provided
  * function whenever it pleases (usually many times!).
  * 
- * @param setter React state update function for the list of managed states
+ * @param map React state update function for the list of managed states
  * @param id ID of the plant or robot to be removed
  */
-const del = <T extends Record<string, unknown>>(setter: (_: (_: Mgmt<T>[]) => Mgmt<T>[]) => void, id: string) => setter((set) => {
-  const idx = set.findIndex(x => x.id === id)
-  if (idx < 0) return set
-  console.log('removing', id)
-  const next = [...set]
-  next.splice(idx, 1)[0].cancel()
-  return next
-})
+const del = <T extends Record<string, unknown>>(sync: () => unknown, map: Map<string, Mgmt<T>>, id: string) => {
+  map.delete(id)
+  sync()
+}
 
 type Props = { actyx: Actyx }
 
@@ -123,20 +127,27 @@ const persistentId = (key: string) => {
 }
 
 export const App = ({ actyx }: Props) => {
-  let effectHasRun = false
+
+  const plants = useRef<Map<string, Mgmt<PlantState>>>(new Map())
+  const robots = useRef<Map<string, Mgmt<RobotState>>>(new Map())
 
   const [plantId, setPlantId] = useState('')
   const [robotId, setRobotId] = useState('')
 
-  // all effects need to go in here, because useState setters are run many times
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const [_, setRefreshSymbol] = useState(Symbol())
+
   useEffect(() => {
-    // React is weird
-    if (effectHasRun) return
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    else effectHasRun = true
+    let alive = true;
+    const isAlive = () => alive
+    const sync = mpmc<void>();
+    sync.sub(() => setRefreshSymbol(Symbol()))
+    const clean = cleanup();
 
     let myPlant = persistentId('plantId')
     const myRobot = persistentId('robotId')
+    setRobotId(myRobot)
+    setPlantId(myPlant)
     console.log('starting: plant', myPlant, 'robot', myRobot)
 
     const restart = (died: boolean) => {
@@ -146,22 +157,36 @@ export const App = ({ actyx }: Props) => {
         myPlant = persistentId('plantId')
         console.log('restarting: plant', myPlant)
       }
-      setPlantId(myPlant)
-      runPlant(actyx, myPlant, () => {}, () => restart(true))
+      runPlant(isAlive, actyx, myPlant, () => {}, () => restart(true))
     }
     restart(false)
 
-    runRobot(actyx, myRobot, () => {})
-    setRobotId(myRobot)
+    runRobot(isAlive, actyx, myRobot, () => {})
 
     // start listening to events from plants and robots to update their lists (and thus the UI)
-    findPlants(actyx, (id) => add(actyx, setPlants, id, followPlant), (id) => del(setPlants, id))
-    findRobots(actyx, (id) => add(actyx, setRobots, id, followRobot), (id) => del(setRobots, id))
+    const unsubPlant = findPlants(actyx, (id) => {
+      const unsub = add(actyx, sync.emit, plants.current, id, followPlant)
+      if (!unsub) return
+      clean.add(unsubPlant)
+    }, (id) => del(sync.emit, plants.current, id))
+
+    const unsubRobot = findRobots(actyx, (id) => {
+      const unsub = add(actyx, sync.emit, robots.current, id, followRobot)
+      if (!unsub) return
+      clean.add(unsub)
+    }, (id) => del(sync.emit, robots.current, id))
+
+    clean.add(unsubPlant)
+    clean.add(unsubRobot)
+
+    sync.emit()
+
+    return () => {
+      alive = false;
+      clean.clean()
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [actyx])
-
-  const [plants, setPlants] = useState<Mgmt<PlantState>[]>([])
-  const [robots, setRobots] = useState<Mgmt<RobotState>[]>([])
   
   return (
     <div>
@@ -176,7 +201,7 @@ export const App = ({ actyx }: Props) => {
           </tr>
         </thead>
         <tbody>
-          {plants.map((plant) => plant.type === 'ready' && (
+          {Array.from(plants.current.values()).map((plant) => plant.type === 'ready' && (
             <tr key={plant.id}>
               <td>{plant.id} {plant.id === plantId ? '*' : undefined}</td>
               <td>{Position.fromPos(plant.state.pos).toString()}</td>
@@ -196,7 +221,7 @@ export const App = ({ actyx }: Props) => {
           </tr>
         </thead>
         <tbody>
-          {robots.map((robot) => robot.type === 'ready' && (
+          {Array.from(robots.current.values()).map((robot) => robot.type === 'ready' && (
             <tr key={robot.id}>
               <td>{robot.id} {robot.id === robotId ? '*' : undefined}</td>
               <td>{Position.fromPos(robot.state.pos).toString()}</td>

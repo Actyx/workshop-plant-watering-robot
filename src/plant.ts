@@ -95,12 +95,13 @@ const LifecycleTag = Tag<Created | Died>('lifecycle')
  * @param stateCb callback to update the UI with the plant’s state
  * @param diedCb callback to call when the plant dies
  */
-export const runPlant = async (actyx: Actyx, id: string, stateCb: (_: PlantState) => void, diedCb: () => void) => {
+export const runPlant = async (isAlive: () => boolean, actyx: Actyx, id: string, stateCb: (_: PlantState) => void, diedCb: () => void) => {
   // this is the basic set of tags for the plant ('plant' and 'plant:<id>')
   const myTag = PlantTag.withId(id)
 
   // get all created/died events for this plant
   const history = await queryAql<LifecycleEvents>(actyx, `FROM ${myTag} & ${LifecycleTag}`)
+  if (!isAlive()) return;
 
   // we calculate the water level based on when it was last watered
   let lastWatered = new Date()
@@ -122,6 +123,7 @@ export const runPlant = async (actyx: Actyx, id: string, stateCb: (_: PlantState
       position = payload.pos
     }
   }
+  if (!isAlive()) return;
 
   // check if the plant has recently asked for water and not yet gotten it
   let hasRequested = await (async () => {
@@ -137,6 +139,7 @@ export const runPlant = async (actyx: Actyx, id: string, stateCb: (_: PlantState
       return undefined
     }
   })()
+  if (!isAlive()) return;
   
   // prepare a machine-runner if there is an outstanding request
   let currentRequest = hasRequested === undefined
@@ -161,6 +164,7 @@ export const runPlant = async (actyx: Actyx, id: string, stateCb: (_: PlantState
     }
     // run the request protocol for water
     for await (const state of currentRequest) {
+      if (!isAlive()) return;
       // this lists only the states in which we need to do something, which is fine because
       // the plant will die eventually if it doesn't get water
       if (state.is(Initial)) {
@@ -183,6 +187,7 @@ export const runPlant = async (actyx: Actyx, id: string, stateCb: (_: PlantState
 
   // the main loop for the plant
   for (;;) {
+    if (!isAlive()) return;
     // first compute remaining water level and update UI
     const now = new Date()
     const elapsed = now.getTime() - lastWatered.getTime()
