@@ -1,10 +1,10 @@
 import { MachineEvent, createMachineRunner } from "@actyx/machine-runner"
-import { protocol, Event } from "./protocol"
+import { wateringProtocol, Event } from "./protocol"
 import { Pos } from "./types"
 import * as z from 'zod'
 import { Actyx, Tag } from "@actyx/sdk"
 import { Position } from "./position"
-import { queryAql } from "./util"
+import { Cleanup, queryAql } from "./util"
 
 /** The velocity of the robot in pixels per second. The size of the arena is 1000x1000 pixels. */
 const VELOCITY = 10
@@ -14,9 +14,9 @@ const VELOCITY = 10
  * protocol for watering.
  */
 
-const RobotMachine = protocol.makeMachine('robot')
+export const RobotMachine = wateringProtocol.makeMachine('robot')
 
-const Initial = RobotMachine.designEmpty('initial')
+export const RobotInitial = RobotMachine.designEmpty('initial')
   .finish()
 
 const Requested = RobotMachine.designState('requested')
@@ -26,12 +26,12 @@ const Requested = RobotMachine.designState('requested')
   .finish()
 
 const Assigned = RobotMachine.designState('assigned')
-  .withPayload<{  plantId: string, plantPos: Pos, robotId: string }>()
+  .withPayload<{ plantId: string, plantPos: Pos, robotId: string }>()
   .command('accept', [Event.Accepted], (_ctx, x: Event.AcceptedPayloadType) => [x])
   .finish()
 
 const Moving = RobotMachine.designState('moving')
-  .withPayload<{ plantId: string, plantPos: Pos, robotId: string, robot: Pos }>()
+  .withPayload<{ plantId: string, plantPos: Pos, robotId: string, robotPos: Pos }>()
   .command('move', [Event.Moving], (ctx, x: Event.MovingPayloadType) => [ctx.withTags(['robot', `robot:${ctx.self.robotId}`], x)])
   .command('done', [Event.Done], (_ctx, x: Event.DonePayloadType) => [x])
   .finish()
@@ -40,15 +40,27 @@ const Done = RobotMachine.designState('done').withPayload<{ robot: Pos }>().fini
 
 const Failed = RobotMachine.designEmpty('failed').finish()
 
-const AllStates = [Initial, Requested, Assigned, Moving, Done, Failed] as const
+const AllStates = [RobotInitial, Requested, Assigned, Moving, Done, Failed] as const
 
-Initial.react([Event.Requested], Requested, (_ctx, { payload: { plantId, position } }) => ({ plantId, plantPos: position, robots: [] }))
-Requested.react([Event.Offered], Requested, (ctx, ev) => { ctx.self.robots.push(ev.payload.robotId); return ctx.self })
-Requested.react([Event.Assigned], Assigned, (ctx, ev) => ({ plantId: ctx.self.plantId, plantPos: ctx.self.plantPos, robotId: ev.payload.robotId }))
-Requested.react([Event.Failed], Failed, () => ({ }))
-Assigned.react([Event.Accepted], Moving, (ctx, ev) => ({ ...ctx.self, robot: ev.payload.position }))
-Moving.reactIntoSelf([Event.Moving], (ctx, ev) => { ctx.self.robot = ev.payload.position; return ctx.self })
-Moving.react([Event.Done], Done, (ctx) => ({ robot: ctx.self.robot }))
+RobotInitial.react([Event.Requested], Requested, (_ctx, { payload: { plantId, position } }) => (
+  { plantId, plantPos: position, robots: [] }
+))
+Requested.react([Event.Offered], Requested, (ctx, ev) => {
+  ctx.self.robots.push(ev.payload.robotId); return ctx.self
+})
+Requested.react([Event.Assigned], Assigned, (ctx, ev) => ({
+  plantId: ctx.self.plantId,
+  plantPos: ctx.self.plantPos,
+  robotId: ev.payload.robotId
+}))
+Requested.react([Event.Failed], Failed, () => ({}))
+Assigned.react([Event.Accepted], Moving, (ctx, ev) => (
+  { ...ctx.self, robotPos: ev.payload.position }
+))
+Moving.reactIntoSelf([Event.Moving], (ctx, ev) => {
+  ctx.self.robotPos = ev.payload.position; return ctx.self
+})
+Moving.react([Event.Done], Done, (ctx) => ({ robot: ctx.self.robotPos }))
 
 // 
 // Besides interacting with the plants, the robot also has its own behaviour.
@@ -91,7 +103,7 @@ const RobotTag = Tag<AllEvents>('robot')
  * @param stateCb callback to update the UI with the robot’s state
  * @param diedCb callback to call when the robot dies
  */
-export const runRobot = async (actyx: Actyx, id: string, stateCb: (state: RobotState) => void) => {
+export const runRobot = async (actyx: Actyx, id: string, stateCb: (state: RobotState) => void, cleanup: Cleanup) => {
   // this is the basic set of tags for the robot ('robot' and 'robot:<id>')
   const myTag = RobotTag.withId(id)
 
@@ -115,29 +127,42 @@ export const runRobot = async (actyx: Actyx, id: string, stateCb: (state: RobotS
 
   if (mission) {
     // get last known position from most recent mission
-    const machine = createMachineRunner(actyx, myTag, Initial, undefined).refineStateType(AllStates)
-    for await (const { payload } of machine) {
-      if (payload && 'robot' in payload) {
-        pos = payload.robot
+    const machine = createMachineRunner(actyx, myTag, RobotInitial, undefined).refineStateType(AllStates)
+    for await (const state of machine) {
+      if (state.is(RobotInitial)) {
+        mission = undefined
+      }
+      const { payload } = state
+      if (payload && 'robotPos' in payload) {
+        pos = payload.robotPos
       }
       break // this automatically destroys the machine-runner instance
     }
   }
 
+  let active = true
+  cleanup.add(() => { active = false })
+
   /**
    * The main loop alternates between waiting for a mission and executing it.
    */
-  for (;;) {
+  while (active) {
+    // console.log('state', { pos, mission })
     stateCb({ pos, mission })
 
     if (mission) {
       // we have a mission, let’s execute it
-      const machine = createMachineRunner(actyx, protocol.tagWithEntityId(mission), Initial, undefined).refineStateType(AllStates)
-
       let moving: NodeJS.Timeout | null = null
       let waitForAccept: NodeJS.Timeout | null = null
       
+      const machine = createMachineRunner(actyx,
+        wateringProtocol.tagWithEntityId(mission),
+        RobotInitial, undefined
+      ).refineStateType(AllStates)
+      cleanup.add(() => machine.destroy())
+
       for await (const state of machine) {
+        // console.log('mission', state)
         if (state.is(Requested)) {
           const s = state.cast()
           if (!s.payload.robots.includes(id)) {
@@ -160,7 +185,9 @@ export const runRobot = async (actyx: Actyx, id: string, stateCb: (state: RobotS
             // inform the plant
             await s.commands()?.accept({ position: pos })
             // take note for self (think restart) and UI
-            await actyx.publish(myTag.and(MissionTag).applyTyped({ type: 'mission', mission }))
+            await actyx.publish(
+              myTag.and(MissionTag).applyTyped({ type: 'mission', mission })
+            )
           } else {
             // someone else got the mission, so we go back to picking a new one
             break
@@ -225,7 +252,7 @@ export const runRobot = async (actyx: Actyx, id: string, stateCb: (state: RobotS
         const m = meta.tags.filter((x) => x.startsWith('wateringProtocol:')).at(0)!.slice('wateringProtocol:'.length)
 
         // check if the mission is free; this is best done by running the protocol
-        const machine = createMachineRunner(actyx, protocol.tagWithEntityId(m), Initial, undefined)
+        const machine = createMachineRunner(actyx, wateringProtocol.tagWithEntityId(m), RobotInitial, undefined)
         for await (const state of machine) {
           if (state.is(Requested)) {
             mission = m
@@ -297,7 +324,7 @@ export const followRobot = (actyx: Actyx, id: string, stateCb: (_: RobotState) =
       case 'moving': {
         const moving = Event.Moving.parse(payload)
         if (moving.success) {
-          console.log('moving', moving.event.position)
+          // console.log('moving', moving.event.position)
           pos = moving.event.position
         }
         break

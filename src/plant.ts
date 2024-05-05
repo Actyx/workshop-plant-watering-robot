@@ -1,11 +1,11 @@
 import { MachineEvent, createMachineRunner } from "@actyx/machine-runner"
-import { protocol, Event } from "./protocol"
+import { wateringProtocol, Event } from "./protocol"
 import { Pos } from "./types"
 import * as z from 'zod'
 import { Actyx, Tag } from "@actyx/sdk"
 import { Position } from "./position"
 import * as UUID from 'uuid'
-import { queryAql } from "./util"
+import { Cleanup, queryAql } from "./util"
 
 /** millisecons it takes for the plant to consume 1% of water */
 const ENDURANCE = 500
@@ -15,9 +15,9 @@ const ENDURANCE = 500
  * protocol for watering.
  */
 
-export const PlantMachine = protocol.makeMachine('plant')
+export const PlantMachine = wateringProtocol.makeMachine('plant')
 
-export const Initial = PlantMachine.designEmpty('initial')
+export const PlantInitial = PlantMachine.designEmpty('initial')
   .command('request', [Event.Requested], (ctx, x: Event.RequestedPayloadType) => [ctx.withTags(['waterRequest'], x)])
   .finish()
 
@@ -38,7 +38,7 @@ export const Done = PlantMachine.designState('done').withPayload<{ when: Date }>
 
 export const Failed = PlantMachine.designEmpty('failed').finish()
 
-Initial.react([Event.Requested], Requested, (_ctx, ev) => ({ ...ev.payload, robots: [] }))
+PlantInitial.react([Event.Requested], Requested, (_ctx, ev) => ({ ...ev.payload, robots: [] }))
 Requested.react([Event.Offered], Requested, (ctx, ev) => ({ ...ctx.self, robots: [...ctx.self.robots, ev.payload.robotId] }))
 Requested.react([Event.Assigned], Assigned, (ctx, ev) => ({ plantId: ctx.self.plantId, position: ctx.self.position, robotId: ev.payload.robotId }))
 Requested.react([Event.Failed], Failed, () => ({}))
@@ -95,7 +95,7 @@ const LifecycleTag = Tag<Created | Died>('lifecycle')
  * @param stateCb callback to update the UI with the plant’s state
  * @param diedCb callback to call when the plant dies
  */
-export const runPlant = async (actyx: Actyx, id: string, stateCb: (_: PlantState) => void, diedCb: () => void) => {
+export const runPlant = async (actyx: Actyx, id: string, stateCb: (_: PlantState) => void, diedCb: () => void, cleanup: Cleanup) => {
   // this is the basic set of tags for the plant ('plant' and 'plant:<id>')
   const myTag = PlantTag.withId(id)
 
@@ -141,7 +141,8 @@ export const runPlant = async (actyx: Actyx, id: string, stateCb: (_: PlantState
   // prepare a machine-runner if there is an outstanding request
   let currentRequest = hasRequested === undefined
     ? undefined
-    : createMachineRunner(actyx, protocol.tagWithEntityId(hasRequested), Initial, undefined)
+    : createMachineRunner(actyx, wateringProtocol.tagWithEntityId(hasRequested), PlantInitial, undefined)
+  cleanup.add(() => currentRequest?.destroy())
   
   // 
   // In the following we have two loops:
@@ -154,7 +155,7 @@ export const runPlant = async (actyx: Actyx, id: string, stateCb: (_: PlantState
     if (newRequest) {
       const reqId = UUID.v4()
       await actyx.publish(myTag.applyTyped({ type: 'waterRequested', reqId }))
-      currentRequest = createMachineRunner(actyx, protocol.tagWithEntityId(reqId), Initial, undefined)
+      currentRequest = createMachineRunner(actyx, wateringProtocol.tagWithEntityId(reqId), PlantInitial, undefined)
       hasRequested = reqId
     } else if (!currentRequest) {
       return
@@ -163,26 +164,29 @@ export const runPlant = async (actyx: Actyx, id: string, stateCb: (_: PlantState
     for await (const state of currentRequest) {
       // this lists only the states in which we need to do something, which is fine because
       // the plant will die eventually if it doesn't get water
-      if (state.is(Initial)) {
-        await state.cast().commands()?.request({ plantId: id, position })
+      if (state.is(PlantInitial)) {
+        await state.cast().commands()?.request({ plantId: id, position, reqId: hasRequested! })
       } else if (state.is(Requested) && state.payload.robots.length > 0) {
         // simply pick the first robot that responded - might be smarter to look at the distance ...
         await state.cast().commands()?.assign({ robotId: state.payload.robots[0] })
       } else if (state.is(Done)) {
         await actyx.publish(myTag.applyTyped({ type: 'waterReceived' }))
-        currentRequest = undefined
-        hasRequested = undefined
         lastWatered = state.payload.when
-        return
+        break
       }
     }
+    currentRequest = undefined
+    hasRequested = undefined
   }  
 
   // follow up on previously uncompleted request if any
   requestWater(false)
 
+  let active = true
+  cleanup.add(() => active = false)
+
   // the main loop for the plant
-  for (;;) {
+  while (active) {
     // first compute remaining water level and update UI
     const now = new Date()
     const elapsed = now.getTime() - lastWatered.getTime()

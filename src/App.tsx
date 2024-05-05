@@ -5,6 +5,7 @@ import { RobotState, followRobot, runRobot } from "./robot"
 import * as UUID from 'uuid'
 import { Position } from "./position"
 import { deepEqual } from "fast-equals"
+import { cleanup } from "./util"
 
 /**
  * Subscribe to Actyx event streams and detect when IDs for a given tag are newly detected or
@@ -17,12 +18,12 @@ import { deepEqual } from "fast-equals"
  * @param addCb callback when a new ID is found
  * @param delCb callback when an ID is removed
  */
-const findIds = (actyx: Actyx, tag: string, addCb: (_: string) => void, delCb: (_: string) => void) => {
+const findIds = (actyx: Actyx, tag: string, addCb: (_: string) => void, delCb: (_: string) => void): (() => void) => {
   // Map of plant IDs to the last time they were seen
   const set = new Map<string, Date>()
 
   // Check every second if a plant has been inactive for more than a minute and remove it if so
-  setInterval(() => {
+  const interval = setInterval(() => {
     const toRemove: string[] = []
     const now = new Date()
     for (const [plant, timestamp] of set) {
@@ -36,7 +37,7 @@ const findIds = (actyx: Actyx, tag: string, addCb: (_: string) => void, delCb: (
 
   // Subscribe to the event stream for the given tag, extract the ID from the event tags and add it to the set
   const tagIdStart = `${tag}:`
-  actyx.subscribeAql(`FROM "${tag}" & TIME > 1m ago`, (resp) => {
+  const cancelSub = actyx.subscribeAql(`FROM "${tag}" & TIME > 1m ago`, (resp) => {
     if (resp.type !== 'event') return
     const id = resp.meta.tags.filter(x => x.startsWith(tagIdStart))[0].slice(tagIdStart.length)
     if (!set.has(id)) {
@@ -44,6 +45,11 @@ const findIds = (actyx: Actyx, tag: string, addCb: (_: string) => void, delCb: (
     }
     set.set(id, resp.meta.timestampAsDate())
   }, (err) => console.log('findPlants stopped due to error:', err))
+
+  return () => {
+    clearInterval(interval)
+    cancelSub()
+  }
 }
 
 const findPlants = (actyx: Actyx, addCb: (_: string) => void, delCb: (_: string) => void) => findIds(actyx, 'plant', addCb, delCb)
@@ -134,6 +140,20 @@ export const App = ({ actyx }: Props) => {
     if (effectHasRun) return
     // eslint-disable-next-line react-hooks/exhaustive-deps
     else effectHasRun = true
+    if (plants.length > 0 || robots.length > 0) {
+      // this happens via hot reload
+      console.log('handling hot-reload')
+      setPlants(plants => {
+        plants.forEach(plant => plant.cancel())
+        return []
+      })
+      setRobots(robots => {
+        robots.forEach(robot => robot.cancel())
+        return []
+      })
+    }
+
+    const clean = cleanup()
 
     let myPlant = persistentId('plantId')
     const myRobot = persistentId('robotId')
@@ -147,16 +167,18 @@ export const App = ({ actyx }: Props) => {
         console.log('restarting: plant', myPlant)
       }
       setPlantId(myPlant)
-      runPlant(actyx, myPlant, () => {}, () => restart(true))
+      runPlant(actyx, myPlant, () => {}, () => restart(true), clean)
     }
     restart(false)
 
-    runRobot(actyx, myRobot, () => {})
+    runRobot(actyx, myRobot, () => {}, clean)
     setRobotId(myRobot)
 
     // start listening to events from plants and robots to update their lists (and thus the UI)
-    findPlants(actyx, (id) => add(actyx, setPlants, id, followPlant), (id) => del(setPlants, id))
-    findRobots(actyx, (id) => add(actyx, setRobots, id, followRobot), (id) => del(setRobots, id))
+    clean.add(findPlants(actyx, (id) => add(actyx, setPlants, id, followPlant), (id) => del(setPlants, id)))
+    clean.add(findRobots(actyx, (id) => add(actyx, setRobots, id, followRobot), (id) => del(setRobots, id)))
+
+    return clean.clean
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [actyx])
 

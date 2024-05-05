@@ -19,7 +19,7 @@ export const PROTOCOL: SwarmProtocolType = {
 
 // events
 export namespace Event {
-  export const RequestedPayload = z.object({ plantId: z.string(), position: Pos })
+  export const RequestedPayload = z.object({ plantId: z.string(), position: Pos, reqId: z.string() })
   export type RequestedPayloadType = z.TypeOf<typeof RequestedPayload>
   export const Requested = MachineEvent.design('requested').withZod(RequestedPayload)
   
@@ -51,4 +51,6 @@ export namespace Event {
 }
 
 // protocol declaration
-export const protocol = SwarmProtocol.make('wateringProtocol', Event.All)
+export const wateringProtocol = SwarmProtocol.make('wateringProtocol', Event.All)
+
+
