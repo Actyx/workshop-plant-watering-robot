@@ -27,7 +27,7 @@ const Requested = RobotMachine.designState('requested')
 
 const Assigned = RobotMachine.designState('assigned')
   .withPayload<{ plantId: string, plantPos: Pos, robotId: string }>()
-  .command('accept', [Event.Accepted], (_ctx, x: Event.AcceptedPayloadType) => [x])
+  .command('start', [Event.Accepted], (_ctx, x: Event.AcceptedPayloadType) => [x])
   .finish()
 
 const Moving = RobotMachine.designState('moving')
@@ -183,7 +183,7 @@ export const runRobot = async (actyx: Actyx, id: string, stateCb: (state: RobotS
           const s = state.cast()
           if (s.payload.robotId === id) {
             // inform the plant
-            await s.commands()?.accept({ position: pos })
+            await s.commands()?.start({ position: pos })
             // take note for self (think restart) and UI
             await actyx.publish(
               myTag.and(MissionTag).applyTyped({ type: 'mission', mission })
