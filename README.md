@@ -32,3 +32,7 @@ Styling has been avoided to keep UI complexity minimal, since this workshop is a
 If you start another app instance (e.g. using a private browser window or by running this project also on another computer in the network) you should see more plants and robots.
 This may require suitable network settings to permit peer-to-peer communication or some configuration of `ax` to initiate the connection.
 Please use the [Actyx NodeManager](https://developer.actyx.com/releases/node-manager/2.12.1) to check on the health and settings of your `ax` instance.
+
+## Acknowledgements
+
+The implementation of these libraries and the underlying theory has been supported by the Horizon Europe EU project «TaRDIS» (grant number 101093006).
