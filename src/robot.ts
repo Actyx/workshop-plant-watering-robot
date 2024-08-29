@@ -7,7 +7,7 @@ import { Position } from "./position"
 import { Cleanup, queryAql } from "./util"
 
 /** The velocity of the robot in pixels per second. The size of the arena is 1000x1000 pixels. */
-const VELOCITY = 10
+export const VELOCITY = 10
 
 /**
  * Description of the robot’s machine: it shows the plant’s role in the swarm
@@ -21,19 +21,21 @@ export const RobotInitial = RobotMachine.designEmpty('initial')
 
 const Requested = RobotMachine.designState('requested')
   .withPayload<{ plantId: string, plantPos: Pos, robots: string[] }>()
-  .command('offer', [Event.Offered], (_ctx, x: Event.OfferedPayloadType) => [x])
-  .command('fail', [Event.Failed], (_ctx, x: Event.FailedPayloadType) => [x])
+  .command('offer', [Event.Offer], (_ctx, x: Event.OfferPayloadType) => [x])
+  .command('fail', [Event.Fail], (_ctx, x: Event.FailPayloadType) => [x])
   .finish()
 
 const Assigned = RobotMachine.designState('assigned')
   .withPayload<{ plantId: string, plantPos: Pos, robotId: string }>()
-  .command('start', [Event.Accepted], (_ctx, x: Event.AcceptedPayloadType) => [x])
+  .command('start', [Event.Accept], (_ctx, x: Event.AcceptPayloadType) => [x])
   .finish()
 
 const Moving = RobotMachine.designState('moving')
   .withPayload<{ plantId: string, plantPos: Pos, robotId: string, robotPos: Pos }>()
-  .command('move', [Event.Moving], (ctx, x: Event.MovingPayloadType) => [ctx.withTags(['robot', `robot:${ctx.self.robotId}`], x)])
-  .command('done', [Event.Done], (_ctx, x: Event.DonePayloadType) => [x])
+  .command('move', [Event.Move], (ctx, x: Event.MovePayloadType) => [
+    ctx.withTags(['robot', `robot:${ctx.self.robotId}`], x)])
+  .command('done', [Event.Finish], (_ctx, x: Event.FinishPayloadType) => [x])
+  .command('fail3', [Event.Fail3], (_ctx, x: Event.Fail3PayloadType) => [x])
   .finish()
 
 const Done = RobotMachine.designState('done').withPayload<{ robot: Pos }>().finish()
@@ -42,25 +44,27 @@ const Failed = RobotMachine.designEmpty('failed').finish()
 
 const AllStates = [RobotInitial, Requested, Assigned, Moving, Done, Failed] as const
 
-RobotInitial.react([Event.Requested], Requested, (_ctx, { payload: { plantId, position } }) => (
+RobotInitial.react([Event.Request], Requested, (_ctx, { payload: { plantId, position } }) => (
   { plantId, plantPos: position, robots: [] }
 ))
-Requested.react([Event.Offered], Requested, (ctx, ev) => {
+Requested.react([Event.Offer], Requested, (ctx, ev) => {
   ctx.self.robots.push(ev.payload.robotId); return ctx.self
 })
-Requested.react([Event.Assigned], Assigned, (ctx, ev) => ({
+Requested.react([Event.Assign], Assigned, (ctx, ev) => ({
   plantId: ctx.self.plantId,
   plantPos: ctx.self.plantPos,
   robotId: ev.payload.robotId
 }))
-Requested.react([Event.Failed], Failed, () => ({}))
-Assigned.react([Event.Accepted], Moving, (ctx, ev) => (
+Requested.react([Event.Fail], Failed, () => ({}))
+Assigned.react([Event.Accept], Moving, (ctx, ev) => (
   { ...ctx.self, robotPos: ev.payload.position }
 ))
-Moving.reactIntoSelf([Event.Moving], (ctx, ev) => {
+Assigned.react([Event.Fail2], Failed, () => ({}))
+Moving.reactIntoSelf([Event.Move], (ctx, ev) => {
   ctx.self.robotPos = ev.payload.position; return ctx.self
 })
-Moving.react([Event.Done], Done, (ctx) => ({ robot: ctx.self.robotPos }))
+Moving.react([Event.Finish], Done, (ctx) => ({ robot: ctx.self.robotPos }))
+Moving.react([Event.Fail3], Failed, () => ({}))
 
 // 
 // Besides interacting with the plants, the robot also has its own behaviour.
@@ -166,7 +170,7 @@ export const runRobot = async (actyx: Actyx, id: string, stateCb: (state: RobotS
         if (state.is(Requested)) {
           const s = state.cast()
           if (!s.payload.robots.includes(id)) {
-            await s.commands()?.offer({ robotId: id })
+            await s.commands()?.offer({ robotId: id, position: pos })
           } else {
             // set timeout to fail if no one accepts
             waitForAccept = setTimeout(() => s.commands()?.fail({ robotId: id }), 1000)
@@ -242,7 +246,7 @@ export const runRobot = async (actyx: Actyx, id: string, stateCb: (state: RobotS
       // - exclude those where the plant has died
       // - then go through them and start bidding on the first one that is still free
       // the query yields results in ascending lamport time order
-      const missions = await queryAql<Event.RequestedPayloadType>(actyx, `PRAGMA features := subQuery interpolation
+      const missions = await queryAql<Event.RequestPayloadType>(actyx, `PRAGMA features := subQuery interpolation
         FROM 'wateringProtocol' & 'waterRequest' & TIME > 1m ago
         FILTER !IsDefined((FROM 'plant' & \`plant:{_.plantId}\` & 'lifecycle' ORDER DESC LIMIT 1 FILTER _.type = 'died')[0])
         `)
@@ -321,8 +325,8 @@ export const followRobot = (actyx: Actyx, id: string, stateCb: (_: RobotState) =
         break
       }
       
-      case 'moving': {
-        const moving = Event.Moving.parse(payload)
+      case 'move': {
+        const moving = Event.Move.parse(payload)
         if (moving.success) {
           // console.log('moving', moving.event.position)
           pos = moving.event.position

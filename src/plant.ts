@@ -6,6 +6,7 @@ import { Actyx, Tag } from "@actyx/sdk"
 import { Position } from "./position"
 import * as UUID from 'uuid'
 import { Cleanup, queryAql } from "./util"
+import { VELOCITY } from "./robot"
 
 /** millisecons it takes for the plant to consume 1% of water */
 const ENDURANCE = 500
@@ -18,12 +19,17 @@ const ENDURANCE = 500
 export const PlantMachine = wateringProtocol.makeMachine('plant')
 
 export const PlantInitial = PlantMachine.designEmpty('initial')
-  .command('request', [Event.Requested], (ctx, x: Event.RequestedPayloadType) => [ctx.withTags(['waterRequest'], x)])
+  .command('request', [Event.Request], (ctx, x: Event.RequestPayloadType) => [ctx.withTags(['waterRequest'], x)])
   .finish()
 
+type RobotWhere = {
+  id: string
+  pos: Pos
+}
+
 export const Requested = PlantMachine.designState('requested')
-  .withPayload<{ plantId: string, position: Pos, robots: string[] }>()
-  .command('assign', [Event.Assigned], (_ctx, x: Event.AssignedPayloadType) => [x])
+  .withPayload<{ plantId: string, position: Pos, robots: RobotWhere[] }>()
+  .command('assign', [Event.Assign], (_ctx, x: Event.AssignPayloadType) => [x])
   .finish()
 
 export const Assigned = PlantMachine.designState('assigned')
@@ -38,13 +44,23 @@ export const Done = PlantMachine.designState('done').withPayload<{ when: Date }>
 
 export const Failed = PlantMachine.designEmpty('failed').finish()
 
-PlantInitial.react([Event.Requested], Requested, (_ctx, ev) => ({ ...ev.payload, robots: [] }))
-Requested.react([Event.Offered], Requested, (ctx, ev) => ({ ...ctx.self, robots: [...ctx.self.robots, ev.payload.robotId] }))
-Requested.react([Event.Assigned], Assigned, (ctx, ev) => ({ plantId: ctx.self.plantId, position: ctx.self.position, robotId: ev.payload.robotId }))
-Requested.react([Event.Failed], Failed, () => ({}))
-Assigned.react([Event.Accepted], Moving, (ctx, ev) => ({ ...ctx.self, robot: ev.payload.position }))
-Moving.react([Event.Moving], Moving, (ctx, ev) => ({ ...ctx.self, robot: ev.payload.position }))
-Moving.react([Event.Done], Done, (_ctx, done) => ({ when: done.meta.timestampAsDate()}))
+PlantInitial.react([Event.Request], Requested, (_ctx, ev) => ({ ...ev.payload, robots: [] }))
+Requested.react([Event.Offer], Requested, (ctx, ev) => ({
+  ...ctx.self,
+  robots: [
+    ...ctx.self.robots,
+    {
+      id: ev.payload.robotId,
+      pos: ev.payload.position,
+    }
+  ]
+}))
+Requested.react([Event.Assign], Assigned, (ctx, ev) => ({ plantId: ctx.self.plantId, position: ctx.self.position, robotId: ev.payload.robotId }))
+Requested.react([Event.Fail], Failed, () => ({}))
+Assigned.react([Event.Accept], Moving, (ctx, ev) => ({ ...ctx.self, robot: ev.payload.position }))
+Assigned.react([Event.Fail2], Failed, () => ({}))
+Moving.react([Event.Move], Moving, (ctx, ev) => ({ ...ctx.self, robot: ev.payload.position }))
+Moving.react([Event.Finish], Done, (_ctx, done) => ({ when: done.meta.timestampAsDate()}))
 
 // 
 // Besides asking to be watered, the plant also has its own behaviour, described below
@@ -167,8 +183,19 @@ export const runPlant = async (actyx: Actyx, id: string, stateCb: (_: PlantState
       if (state.is(PlantInitial)) {
         await state.cast().commands()?.request({ plantId: id, position, reqId: hasRequested! })
       } else if (state.is(Requested) && state.payload.robots.length > 0) {
-        // simply pick the first robot that responded - might be smarter to look at the distance ...
-        await state.cast().commands()?.assign({ robotId: state.payload.robots[0] })
+        // check if any robot is close enough and pick the one that is closest
+        let closest: RobotWhere | undefined = undefined
+        let closestDist = Number.MAX_VALUE
+        for (const robot of state.payload.robots) {
+          const dist = Position.fromPos(robot.pos).direction(Position.fromPos(position)).length()
+          if (dist < closestDist) {
+            closest = robot
+            closestDist = dist
+          }
+        }
+        if (closest && closestDist < 24 * ENDURANCE * VELOCITY) {
+          await state.cast().commands()?.assign({ robotId: closest.id })
+        }
       } else if (state.is(Done)) {
         await actyx.publish(myTag.applyTyped({ type: 'waterReceived' }))
         lastWatered = state.payload.when
@@ -200,7 +227,7 @@ export const runPlant = async (actyx: Actyx, id: string, stateCb: (_: PlantState
       return
     }
 
-    if (waterLevel < 25 && !currentRequest) {
+    if (waterLevel < 50 && !currentRequest) {
       // run the request for water in the background, it will eventually update lastWatered
       requestWater()
     }
